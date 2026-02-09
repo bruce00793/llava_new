@@ -1,0 +1,1161 @@
+"""
+Training script for LLaVA Map Detection
+Stage 2: Joint training with BLIP-2 pretrained Q-Former
+
+Training strategy (Optimized):
+- Q-Former Backbone: 5e-6 (freeze-like, minimal change)
+- Q-Former Decoder: 1e-5 (fine-tune from BLIP-2)
+- Q-Former Projector: 5e-5 (adapt to new task)
+- Map Queries: 1e-4 (train from scratch)
+- Map Decoder: 1e-4 (train from scratch)
+- LLM Backbone: Frozen
+
+Optimizations:
+- Gradient Accumulation: effective batch_size = batch_size * accumulation_steps
+- Fine-grained Parameter Groups: 5 groups with layer-wise learning rates
+- EMA (Exponential Moving Average): smoother model for evaluation
+- Optimized Learning Rates: based on pre-training status
+
+Author: Auto-generated for Map Detection
+Date: 2025-01
+"""
+
+import os
+import sys
+import json
+import copy
+import argparse
+from datetime import datetime
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
+from transformers import AutoTokenizer, CLIPImageProcessor
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from llava.model.map_llava_model import build_map_detector
+from llava.data.map_dataset import MapDetectionDataset
+from llava.model.map_config import MapDetectionConfig
+from llava.model.map_eval import MapEvaluator
+
+
+class EMA:
+    """
+    Exponential Moving Average for model parameters.
+    
+    Maintains a shadow copy of model parameters that is updated with:
+        shadow = decay * shadow + (1 - decay) * param
+    
+    This provides a smoother version of the model for evaluation.
+    """
+    
+    def __init__(self, model, decay: float = 0.9999):
+        """
+        Args:
+            model: The model to track
+            decay: EMA decay rate (default: 0.9999)
+        """
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        
+        # Initialize shadow parameters
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self):
+        """Update shadow parameters with current model parameters."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                new_average = (
+                    self.decay * self.shadow[name] +
+                    (1.0 - self.decay) * param.data
+                )
+                self.shadow[name] = new_average.clone()
+    
+    def apply_shadow(self):
+        """Replace model parameters with shadow parameters for evaluation."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name].clone()
+    
+    def restore(self):
+        """Restore original model parameters after evaluation."""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data = self.backup[name].clone()
+        self.backup = {}
+    
+    def state_dict(self):
+        """Get state dict for checkpointing."""
+        return {
+            'decay': self.decay,
+            'shadow': self.shadow,
+        }
+    
+    def load_state_dict(self, state_dict):
+        """Load state dict from checkpoint."""
+        self.decay = state_dict['decay']
+        # Move shadow parameters to the same device as model parameters
+        self.shadow = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in state_dict['shadow']:
+                self.shadow[name] = state_dict['shadow'][name].to(param.device)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train LLaVA Map Detection')
+    
+    # Dataset
+    parser.add_argument('--dataroot', type=str, required=True,
+                        help='Path to nuScenes dataset root')
+    parser.add_argument('--version', type=str, default='v1.0-mini',
+                        choices=['v1.0-mini', 'v1.0-trainval'],
+                        help='nuScenes version')
+    parser.add_argument('--gt-cache-train', type=str, default=None,
+                        help='Path to train GT cache (if None, will auto-generate)')
+    parser.add_argument('--gt-cache-val', type=str, default=None,
+                        help='Path to val GT cache (if None, will auto-generate)')
+    
+    # Model
+    parser.add_argument('--llm-path', type=str, default='lmsys/vicuna-7b-v1.5',
+                        help='Path to LLM checkpoint')
+    parser.add_argument('--qformer-pretrained', type=str, default='blip2',
+                        choices=['blip2', 'none'],
+                        help='Q-Former pretrained weights (blip2 or none)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    
+    # Training
+    parser.add_argument('--epochs', type=int, default=24,
+                        help='Number of training epochs')
+    parser.add_argument('--batch-size', type=int, default=4,
+                        help='Batch size per GPU')
+    parser.add_argument('--accumulation-steps', type=int, default=4,
+                        help='Gradient accumulation steps (effective batch = batch_size * accumulation)')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='Number of data loading workers')
+    
+    # Fine-grained learning rates
+    parser.add_argument('--lr-qformer-backbone', type=float, default=5e-6,
+                        help='Learning rate for Q-Former backbone (minimal change)')
+    parser.add_argument('--lr-qformer-decoder', type=float, default=1e-5,
+                        help='Learning rate for Q-Former decoder (fine-tune)')
+    parser.add_argument('--lr-qformer-projector', type=float, default=5e-5,
+                        help='Learning rate for Q-Former projector (adapt to new task)')
+    parser.add_argument('--lr-queries', type=float, default=1e-4,
+                        help='Learning rate for Map Queries (train from scratch)')
+    parser.add_argument('--lr-decoder', type=float, default=1e-4,
+                        help='Learning rate for Map Decoder (train from scratch)')
+    parser.add_argument('--lr-lora', type=float, default=2e-4,
+                        help='Learning rate for LoRA parameters (fine-tuning LLM attention)')
+    
+    parser.add_argument('--weight-decay', type=float, default=0.01,
+                        help='Weight decay')
+    parser.add_argument('--warmup-steps', type=int, default=500,
+                        help='Number of warmup steps')
+    parser.add_argument('--grad-clip', type=float, default=5.0,
+                        help='Gradient clipping (MapTR uses 35.0, 5.0 is more conservative)')
+    
+    # EMA
+    parser.add_argument('--use-ema', action='store_true', default=True,
+                        help='Use Exponential Moving Average')
+    parser.add_argument('--ema-decay', type=float, default=0.9999,
+                        help='EMA decay rate')
+    
+    # Mixed precision
+    parser.add_argument('--fp16', action='store_true',
+                        help='Use FP16 mixed precision training (NOT recommended, use --bf16)')
+    parser.add_argument('--bf16', action='store_true',
+                        help='Use BF16 mixed precision training (RECOMMENDED for 4090/A100/H100)')
+    
+    # Debug
+    parser.add_argument('--detect-anomaly', action='store_true',
+                        help='Enable torch.autograd.detect_anomaly() to find NaN source (SLOW, debug only)')
+    
+    # Logging & Checkpointing
+    parser.add_argument('--output-dir', type=str, default='./outputs/map_detection',
+                        help='Output directory for checkpoints and logs')
+    parser.add_argument('--log-interval', type=int, default=10,
+                        help='Log every N steps')
+    parser.add_argument('--save-interval', type=int, default=1,
+                        help='Save checkpoint every N epochs')
+    parser.add_argument('--eval-interval', type=int, default=1,
+                        help='Evaluate every N epochs')
+    
+    # Distributed
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='Local rank for distributed training')
+    
+    args = parser.parse_args()
+    return args
+
+
+def setup_distributed():
+    """Setup distributed training"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+    
+    if world_size > 1:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://',
+                                world_size=world_size, rank=rank)
+        dist.barrier()
+    
+    return rank, world_size, local_rank
+
+
+def build_optimizer(model, args):
+    """
+    Build optimizer with fine-grained learning rates for different modules:
+    
+    Learning Rate Strategy:
+    - Q-Former Backbone (ResNet):   5e-6  (minimal change, preserve features)
+    - Q-Former Decoder:             1e-5  (fine-tune from BLIP-2)
+    - Q-Former Projector:           5e-5  (adapt to new task)
+    - Map Queries:                  1e-4  (train from scratch)
+    - Map Decoder:                  1e-4  (train from scratch)
+    - LoRA parameters:              2e-4  (LoRA fine-tuning, 新增!)
+    """
+    # Fine-grained parameter groups
+    qformer_backbone_params = []  # img_backbone, img_neck
+    qformer_decoder_params = []   # decoder layers
+    qformer_projector_params = [] # projector to LLM dim
+    qformer_other_params = []     # query_embed, camera_embed, position_encoding
+    queries_params = []           # instance_queries, point_queries
+    decoder_params = []           # feature_reducer, cls_head, points_head
+    scene_interaction_params = [] # map_scene_interaction module
+    lora_params = []              # LoRA parameters (新增!)
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        # Q-Former parameters
+        if 'qformer' in name:
+            if 'img_backbone' in name or 'img_neck' in name:
+                qformer_backbone_params.append(param)
+            elif 'decoder' in name:
+                qformer_decoder_params.append(param)
+            elif 'projector' in name:
+                qformer_projector_params.append(param)
+            else:
+                # query_embed, camera_embed, position_encoding
+                qformer_other_params.append(param)
+        
+        # Map Queries parameters
+        elif 'map_queries' in name:
+            queries_params.append(param)
+        
+        # Map Scene Interaction parameters (train from scratch, use decoder lr)
+        elif 'map_scene_interaction' in name:
+            scene_interaction_params.append(param)
+        
+        # Map Decoder parameters
+        elif 'decoder' in name:
+            decoder_params.append(param)
+        
+        # LoRA parameters (必须在 'llm' 检查之前!)
+        elif 'lora_' in name:
+            lora_params.append(param)
+        
+        # Skip frozen LLM parameters (lm_head etc.)
+        # 注意: LoRA 参数已在上面处理，这里只跳过真正冻结的参数
+        elif 'llm' in name:
+            # 如果走到这里且 requires_grad=True，说明是意外情况
+            print(f"Warning: Unexpected trainable LLM parameter (not LoRA): {name}")
+            continue
+        
+        else:
+            # Should not happen if freeze_llm=True
+            print(f"Warning: Unexpected trainable parameter: {name}")
+    
+    # Combine qformer_other with decoder (similar learning rate)
+    qformer_decoder_params.extend(qformer_other_params)
+    
+    # Create parameter groups with different learning rates
+    param_groups = []
+    
+    if qformer_backbone_params:
+        param_groups.append({
+            'params': qformer_backbone_params,
+            'lr': args.lr_qformer_backbone,
+            'name': 'qformer_backbone',
+        })
+    
+    if qformer_decoder_params:
+        param_groups.append({
+            'params': qformer_decoder_params,
+            'lr': args.lr_qformer_decoder,
+            'name': 'qformer_decoder',
+        })
+    
+    if qformer_projector_params:
+        param_groups.append({
+            'params': qformer_projector_params,
+            'lr': args.lr_qformer_projector,
+            'name': 'qformer_projector',
+        })
+    
+    if queries_params:
+        param_groups.append({
+            'params': queries_params,
+            'lr': args.lr_queries,
+            'name': 'map_queries',
+        })
+    
+    if decoder_params:
+        param_groups.append({
+            'params': decoder_params,
+            'lr': args.lr_decoder,
+            'name': 'map_decoder',
+        })
+    
+    if scene_interaction_params:
+        param_groups.append({
+            'params': scene_interaction_params,
+            'lr': args.lr_decoder,  # Use same lr as decoder (train from scratch)
+            'name': 'scene_interaction',
+        })
+    
+    # LoRA parameters (for LLM fine-tuning)
+    if lora_params:
+        param_groups.append({
+            'params': lora_params,
+            'lr': args.lr_lora,
+            'name': 'lora',
+        })
+    
+    # Print parameter counts
+    print("\n" + "="*70)
+    print("Parameter Groups (Fine-grained Learning Rates):")
+    print("="*70)
+    total_trainable = 0
+    for group in param_groups:
+        num_params = sum(p.numel() for p in group['params'])
+        total_trainable += num_params
+        print(f"  {group['name']:20s}: {num_params:12,} params, lr={group['lr']:.1e}")
+    print("-"*70)
+    print(f"  {'Total Trainable':20s}: {total_trainable:12,} params")
+    # Effective batch size = batch_size × accumulation × world_size
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    effective_batch = args.batch_size * args.accumulation_steps * world_size
+    print(f"  {'Effective Batch Size':20s}: {effective_batch:12,} (={args.batch_size}×{args.accumulation_steps}×{world_size}gpu)")
+    print("="*70 + "\n")
+    
+    # Create optimizer
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    )
+    
+    return optimizer
+
+
+def get_lr_scheduler(optimizer, args, steps_per_epoch):
+    """
+    Learning rate scheduler with warmup and cosine decay
+    
+    参考 MapTR 的策略:
+    - warmup_ratio = 1/3 (从 1/3 基础学习率开始)
+    - min_lr_ratio = 1e-3 (最小学习率是基础的 0.1%)
+    """
+    total_steps = args.epochs * steps_per_epoch
+    warmup_ratio = 1.0 / 3.0  # MapTR 使用 1/3 作为起始比例
+    min_lr_ratio = 1e-3       # MapTR 使用 1e-3 作为最小比例
+    
+    def lr_lambda(current_step):
+        # Warmup: 从 warmup_ratio 线性增加到 1.0
+        if current_step < args.warmup_steps:
+            # 从 1/3 开始，线性增长到 1.0
+            progress = float(current_step) / float(max(1, args.warmup_steps))
+            return warmup_ratio + (1.0 - warmup_ratio) * progress
+        
+        # Cosine decay: 从 1.0 衰减到 min_lr_ratio
+        progress = float(current_step - args.warmup_steps) / float(max(1, total_steps - args.warmup_steps))
+        cosine_decay = 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159265359)))
+        # 映射到 [min_lr_ratio, 1.0] 范围
+        return max(min_lr_ratio, min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay)
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    return scheduler
+
+
+def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args, rank, ema=None):
+    """
+    Train for one epoch with gradient accumulation and EMA.
+    
+    Args:
+        model: The model to train
+        dataloader: Training data loader
+        optimizer: Optimizer
+        scheduler: Learning rate scheduler
+        scaler: GradScaler for mixed precision
+        epoch: Current epoch number
+        args: Training arguments
+        rank: Process rank for distributed training
+        ema: EMA object (optional)
+    """
+    model.train()
+    
+    total_loss = 0.0
+    loss_dict_accum = {}
+    num_updates = 0
+    
+    # Gradient accumulation setup
+    accumulation_steps = args.accumulation_steps
+    optimizer.zero_grad()
+    
+    for step, batch in enumerate(dataloader):
+        # Move to GPU
+        images = batch['images'].cuda(non_blocking=True)  # [B, 6, 3, 448, 800]
+        text_ids = batch['text_ids'].cuda(non_blocking=True)  # [B, L]
+        gt_labels = batch['gt_labels'].cuda(non_blocking=True)  # [B, M]
+        gt_points = batch['gt_points'].cuda(non_blocking=True)  # [B, M, 20, 2]
+        gt_masks = batch['gt_masks'].cuda(non_blocking=True)  # [B, M]
+        
+        # Camera parameters for 3D position encoding in Q-Former
+        cam_intrinsics = batch['cam_intrinsics'].cuda(non_blocking=True)  # [B, 6, 3, 3]
+        cam_extrinsics = batch['cam_extrinsics'].cuda(non_blocking=True)  # [B, 6, 4, 4]
+        
+        # detect_anomaly 已完成调试任务（已定位 NaN 来源为 CoordinateEncoder 频率过高）
+        # 正常训练中不再启用（会显著减慢速度且在 DDP 中可能导致崩溃）
+        
+        # Forward with mixed precision
+        use_amp = args.bf16 or args.fp16
+        amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
+        with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+            output = model(
+                images=images,
+                text_ids=text_ids,
+                return_loss=True,
+                gt_labels=gt_labels,
+                gt_points=gt_points,
+                gt_masks=gt_masks,
+                cam_intrinsics=cam_intrinsics,
+                cam_extrinsics=cam_extrinsics,
+            )
+            
+            loss = output['loss'].float() / accumulation_steps
+            loss_dict = output['loss_dict']
+        
+        # ========== NaN 检测和同步跳过 ==========
+        # 检测 loss 是否为 NaN 或 Inf
+        # 重要：所有 GPU 必须同步决定是否跳过，否则会导致 NCCL 死锁
+        has_nan = torch.isnan(loss).any() or torch.isinf(loss).any()
+        
+        # 在分布式环境中，同步所有 GPU 的 NaN 状态
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            nan_flag = torch.tensor([1.0 if has_nan else 0.0], device=loss.device)
+            dist.all_reduce(nan_flag, op=dist.ReduceOp.MAX)
+            has_nan = nan_flag.item() > 0
+        
+        if has_nan:
+            if rank == 0:
+                print(f"⚠️ NaN/Inf detected at Epoch {epoch+1} Step {step+1}, skipping this batch (all GPUs synced)")
+            optimizer.zero_grad()
+            continue
+        
+        # Backward (accumulate gradients)
+        # BF16 不需要 GradScaler（指数范围与 FP32 相同）
+        # FP16 才需要 scaler 来防止梯度下溢
+        if args.fp16 and scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
+        # Accumulate losses for logging (use unscaled loss)
+        loss_value = loss.item() * accumulation_steps
+        if not (torch.isnan(torch.tensor(loss_value)) or torch.isinf(torch.tensor(loss_value))):
+            total_loss += loss_value
+        else:
+            # 不使用 continue，因为已经完成了 backward，需要继续执行后续同步操作
+            if rank == 0:
+                print(f"⚠️ NaN loss value at step {step+1}, not accumulating but continuing")
+        for key, value in loss_dict.items():
+            if key not in loss_dict_accum:
+                loss_dict_accum[key] = 0.0
+            loss_dict_accum[key] += value.item()
+        
+        # Update weights every accumulation_steps
+        if (step + 1) % accumulation_steps == 0:
+            skip_optimizer_step = False
+            
+            if args.fp16 and scaler is not None:
+                scaler.unscale_(optimizer)
+                grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                
+                if not torch.isfinite(grad_norm_before):
+                    if rank == 0:
+                        print(f"❌ [Step {step+1}] Gradient contains NaN/Inf! Skipping optimizer step.", flush=True)
+                    skip_optimizer_step = True
+                    optimizer.zero_grad()
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    if rank == 0 and grad_norm_before > args.grad_clip * 10:
+                        print(f"⚠️ [Step {step+1}] Large gradient detected! "
+                              f"Norm before clip: {grad_norm_before:.2f}", flush=True)
+                    scaler.step(optimizer)
+                    scaler.update()
+            else:
+                # BF16 或 FP32 模式 — 不需要 GradScaler
+                grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                
+                if not torch.isfinite(grad_norm_before):
+                    if rank == 0:
+                        print(f"❌ [Step {step+1}] Gradient contains NaN/Inf! Skipping optimizer step.", flush=True)
+                        # 【NaN 调试】打印哪些参数组包含 NaN 梯度
+                        for group in optimizer.param_groups:
+                            group_name = group.get('name', 'unknown')
+                            nan_count = 0
+                            inf_count = 0
+                            total_count = 0
+                            for p in group['params']:
+                                if p.grad is not None:
+                                    total_count += 1
+                                    if torch.isnan(p.grad).any():
+                                        nan_count += 1
+                                    if torch.isinf(p.grad).any():
+                                        inf_count += 1
+                            if nan_count > 0 or inf_count > 0:
+                                print(f"   ⚠️ {group_name}: {nan_count} NaN params, {inf_count} Inf params (of {total_count})", flush=True)
+                    skip_optimizer_step = True
+                    optimizer.zero_grad()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    if rank == 0 and grad_norm_before > args.grad_clip * 10:
+                        print(f"⚠️ [Step {step+1}] Large gradient detected! "
+                              f"Norm before clip: {grad_norm_before:.2f}", flush=True)
+                    optimizer.step()
+            
+            if not skip_optimizer_step:
+                optimizer.zero_grad()
+                scheduler.step()
+                num_updates += 1
+            
+            # Update EMA
+            if ema is not None:
+                ema.update()
+        
+        # Logging
+        if rank == 0 and (step + 1) % args.log_interval == 0:
+            avg_loss = total_loss / (step + 1)
+            
+            # Get learning rates from all groups
+            lr_info = []
+            for group in optimizer.param_groups:
+                name = group.get('name', 'unknown')[:8]
+                lr_info.append(f"{name}={group['lr']:.1e}")
+            lr_str = ' '.join(lr_info[:3])  # Show first 3
+            
+            print(f"Epoch [{epoch+1}/{args.epochs}] Step [{step+1}/{len(dataloader)}] "
+                  f"Loss: {loss.item()*accumulation_steps:.4f} (Avg: {avg_loss:.4f}) "
+                  f"LR: {lr_str}")
+            
+            # Print detailed losses
+            if (step + 1) % (args.log_interval * 10) == 0:
+                print("  Detailed losses:")
+                for key, value in loss_dict.items():
+                    avg_value = loss_dict_accum[key] / (step + 1)
+                    print(f"    {key}: {value.item():.4f} (Avg: {avg_value:.4f})")
+    
+    # Handle remaining gradients (if not divisible by accumulation_steps)
+    remaining = len(dataloader) % accumulation_steps
+    if remaining > 0:
+        skip_final_step = False
+        if args.fp16 and scaler is not None:
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+            if not torch.isfinite(grad_norm):
+                if rank == 0:
+                    print(f"❌ [Final step] Gradient contains NaN/Inf! Skipping.", flush=True)
+                skip_final_step = True
+                optimizer.zero_grad()
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+            if not torch.isfinite(grad_norm):
+                if rank == 0:
+                    print(f"❌ [Final step] Gradient contains NaN/Inf! Skipping.", flush=True)
+                skip_final_step = True
+                optimizer.zero_grad()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+        
+        if not skip_final_step:
+            optimizer.zero_grad()
+            scheduler.step()
+            num_updates += 1
+        
+        if ema is not None:
+            ema.update()
+    
+    # Epoch summary
+    avg_loss = total_loss / len(dataloader)  # 所有 rank 都计算
+    
+    if rank == 0:
+        print(f"\n{'='*70}")
+        print(f"Epoch {epoch+1} Summary:")
+        print(f"  Average Loss: {avg_loss:.4f}")
+        print(f"  Total Updates: {num_updates}")
+        print(f"  Effective Samples: {len(dataloader) * args.batch_size}")
+        for key, value in loss_dict_accum.items():
+            print(f"  {key}: {value / len(dataloader):.4f}")
+        print(f"{'='*70}\n")
+    
+    # 【重要】训练完成后同步所有 GPU，防止某些 GPU 提前进入 validation
+    if dist.is_initialized():
+        if rank == 0:
+            print(f"[DEBUG] Syncing all GPUs after training epoch {epoch+1}...", flush=True)
+        dist.barrier()
+        if rank == 0:
+            print(f"[DEBUG] All GPUs finished training epoch {epoch+1}!", flush=True)
+    
+    return avg_loss
+
+
+@torch.no_grad()
+def validate(model, dataloader, epoch, args, rank, ema=None, compute_map=True):
+    """
+    Validation with optional EMA model and mAP computation.
+    
+    If EMA is provided, validation uses the smoothed EMA weights.
+    
+    Args:
+        model: The model to evaluate
+        dataloader: Validation data loader
+        epoch: Current epoch number
+        args: Training arguments
+        rank: Process rank for distributed training
+        ema: EMA object (optional)
+        compute_map: Whether to compute mAP metrics
+    
+    Returns:
+        (avg_loss, metrics_dict) if compute_map else avg_loss
+    """
+    import sys
+    
+    # 【调试】打印进入 validation 的信息
+    if rank == 0:
+        print(f"\n[DEBUG] Entering validation for epoch {epoch+1}...", flush=True)
+        sys.stdout.flush()
+    
+    # 【重要】同步所有 GPU 进程，确保都到达这里
+    if dist.is_initialized():
+        if rank == 0:
+            print(f"[DEBUG] Waiting for all GPUs to sync before validation...", flush=True)
+        dist.barrier()
+        if rank == 0:
+            print(f"[DEBUG] All GPUs synced!", flush=True)
+    
+    model.eval()
+    
+    # Apply EMA weights if available
+    if ema is not None:
+        if rank == 0:
+            print(f"[DEBUG] Applying EMA weights...", flush=True)
+        ema.apply_shadow()
+        if rank == 0:
+            print(f"[DEBUG] EMA weights applied!", flush=True)
+    
+    total_loss = 0.0
+    loss_dict_accum = {}
+    
+    # Initialize evaluator for mAP computation
+    evaluator = MapEvaluator() if compute_map else None
+    
+    if rank == 0:
+        print(f"[DEBUG] Starting validation loop, total batches: {len(dataloader)}", flush=True)
+    
+    for step, batch in enumerate(dataloader):
+        if step == 0 and rank == 0:
+            print(f"[DEBUG] First validation batch loaded successfully!", flush=True)
+        
+        # 进度打印（每 100 步打印一次）
+        if rank == 0 and (step + 1) % 100 == 0:
+            print(f"  Validating... [{step+1}/{len(dataloader)}] ({100*(step+1)/len(dataloader):.1f}%)", flush=True)
+        
+        # Move to GPU
+        images = batch['images'].cuda(non_blocking=True)
+        text_ids = batch['text_ids'].cuda(non_blocking=True)
+        gt_labels = batch['gt_labels'].cuda(non_blocking=True)
+        gt_points = batch['gt_points'].cuda(non_blocking=True)
+        gt_masks = batch['gt_masks'].cuda(non_blocking=True)
+        
+        # Camera parameters for 3D position encoding
+        cam_intrinsics = batch.get('cam_intrinsics')
+        cam_extrinsics = batch.get('cam_extrinsics')
+        if cam_intrinsics is not None:
+            cam_intrinsics = cam_intrinsics.cuda(non_blocking=True)
+        if cam_extrinsics is not None:
+            cam_extrinsics = cam_extrinsics.cuda(non_blocking=True)
+        
+        # Forward
+        use_amp = args.bf16 or args.fp16
+        amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
+        with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+            output = model(
+                images=images,
+                text_ids=text_ids,
+                return_loss=True,
+                gt_labels=gt_labels,
+                gt_points=gt_points,
+                gt_masks=gt_masks,
+                cam_intrinsics=cam_intrinsics,
+                cam_extrinsics=cam_extrinsics,
+            )
+            
+            loss = output['loss'].float()  # 确保 FP32
+            loss_dict = output['loss_dict']
+        
+        # Accumulate loss
+        total_loss += loss.item()
+        for key, value in loss_dict.items():
+            if key not in loss_dict_accum:
+                loss_dict_accum[key] = 0.0
+            loss_dict_accum[key] += value.item()
+        
+        # Add predictions to evaluator for mAP computation
+        if evaluator is not None and 'pred_logits' in output and 'pred_points' in output:
+            evaluator.add_batch(
+                pred_logits=output['pred_logits'],
+                pred_points=output['pred_points'],
+                gt_labels=gt_labels,
+                gt_points=gt_points,
+                gt_masks=gt_masks,
+            )
+    
+    # Restore original weights
+    if ema is not None:
+        ema.restore()
+    
+    # 【重要】分布式验证：同步所有 GPU
+    if dist.is_initialized():
+        if rank == 0:
+            print(f"[DEBUG] Validation loop finished, syncing all GPUs...", flush=True)
+        dist.barrier()
+        if rank == 0:
+            print(f"[DEBUG] All GPUs finished validation loop!", flush=True)
+    
+    # Compute metrics
+    avg_loss = total_loss / max(len(dataloader), 1)
+    metrics = {}
+    
+    if evaluator is not None:
+        metrics = evaluator.compute_metrics()
+    
+    # Print results
+    if rank == 0:
+        ema_str = " (EMA)" if ema is not None else ""
+        print(f"\n{'='*70}")
+        print(f"Validation Epoch {epoch+1}{ema_str}:")
+        print(f"  Average Loss: {avg_loss:.4f}")
+        for key, value in loss_dict_accum.items():
+            print(f"  {key}: {value / len(dataloader):.4f}")
+        
+        # Print mAP metrics
+        if metrics:
+            print(f"\n  📊 mAP Metrics:")
+            for thresh in [0.5, 1.0, 1.5]:
+                mAP_key = f'mAP@{thresh}m'
+                if mAP_key in metrics:
+                    print(f"    mAP@{thresh}m: {metrics[mAP_key]*100:.2f}%")
+            if 'mAP' in metrics:
+                print(f"    ⭐ Overall mAP: {metrics['mAP']*100:.2f}%")
+            
+            # Per-class AP at 1.0m threshold
+            print(f"\n  📈 Per-class AP@1.0m:")
+            for cls_name in ['divider', 'ped_crossing', 'boundary']:
+                ap_key = f'AP_{cls_name}@1.0m'
+                if ap_key in metrics:
+                    print(f"    {cls_name}: {metrics[ap_key]*100:.2f}%")
+        
+        print(f"{'='*70}\n")
+    
+    if compute_map:
+        return avg_loss, metrics
+    else:
+        return avg_loss
+
+
+def save_checkpoint(model, optimizer, scheduler, epoch, args, filename, ema=None):
+    """
+    Save checkpoint with optional EMA state.
+    """
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'args': vars(args),
+    }
+    
+    # Save EMA state if available
+    if ema is not None:
+        checkpoint['ema_state_dict'] = ema.state_dict()
+    
+    save_path = os.path.join(args.output_dir, filename)
+    torch.save(checkpoint, save_path)
+    print(f"💾 Checkpoint saved to {save_path}")
+
+
+def save_ema_model(model, ema, args, filename):
+    """
+    Save model with EMA weights (for inference).
+    """
+    if ema is None:
+        return
+    
+    # Apply EMA weights
+    ema.apply_shadow()
+    
+    # Save
+    save_path = os.path.join(args.output_dir, filename)
+    torch.save(model.state_dict(), save_path)
+    print(f"💾 EMA model saved to {save_path}")
+    
+    # Restore original weights
+    ema.restore()
+
+
+def main():
+    # Parse arguments
+    args = parse_args()
+    
+    # Setup distributed
+    rank, world_size, local_rank = setup_distributed()
+    
+    if rank == 0:
+        print("\n" + "="*70)
+        print("LLaVA Map Detection Training - Stage 2 (Optimized)")
+        print("="*70)
+        print(f"Training Configuration:")
+        for key, value in vars(args).items():
+            print(f"  {key}: {value}")
+        print("="*70 + "\n")
+    
+    # Enable anomaly detection if requested (for debugging NaN)
+    if args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
+        if rank == 0:
+            print("⚠️  ANOMALY DETECTION ENABLED - Training will be 2-3x slower!")
+            print("   This will help find the exact source of NaN/Inf errors.")
+            print("   Disable with removing --detect-anomaly flag for normal training.\n")
+    
+    # Create output directory
+    if rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+        # Save config
+        with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
+            json.dump(vars(args), f, indent=2)
+    
+    # Build model
+    if rank == 0:
+        print("Building model...")
+    
+    model = build_map_detector(
+        llm_path=args.llm_path,
+        freeze_llm=True,  # Stage 2: Freeze LLM
+        qformer_pretrained='blip2' if args.qformer_pretrained == 'blip2' else None,
+    )
+    
+    model = model.cuda()
+    
+    # Wrap with DDP if needed
+    if world_size > 1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,  # 允许模型有未使用的参数
+        )
+    
+    # Build optimizer
+    base_model = model.module if world_size > 1 else model
+    optimizer = build_optimizer(base_model, args)
+    
+    # Initialize EMA
+    ema = None
+    if args.use_ema:
+        if rank == 0:
+            print(f"✅ EMA enabled with decay={args.ema_decay}")
+        ema = EMA(base_model, decay=args.ema_decay)
+    
+    # Build datasets
+    if rank == 0:
+        print("\nLoading datasets...")
+    
+    # Tokenizer and image processor
+    tokenizer = AutoTokenizer.from_pretrained(args.llm_path, use_fast=False)
+    
+    # Use local CLIP path to avoid network issues
+    local_clip_path = "/home/cly/auto/llava_test/LLaVA/clip-vit-large-patch14-336"
+    if os.path.exists(local_clip_path):
+        image_processor = CLIPImageProcessor.from_pretrained(local_clip_path)
+        if rank == 0:
+            print(f"✅ Using local CLIP: {local_clip_path}")
+    else:
+        image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
+    
+    train_dataset = MapDetectionDataset(
+        dataroot=args.dataroot,
+        version=args.version,
+        split='train',
+        gt_cache_path=args.gt_cache_train,
+        image_processor=image_processor,
+        tokenizer=tokenizer,
+    )
+    
+    # Check if val GT cache exists before creating val dataset
+    val_dataset = None
+    if args.gt_cache_val and (os.path.exists(args.gt_cache_val) or os.path.isdir(args.gt_cache_val)):
+        val_dataset = MapDetectionDataset(
+            dataroot=args.dataroot,
+            version=args.version,
+            split='val',
+            gt_cache_path=args.gt_cache_val,
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+        )
+    else:
+        if rank == 0:
+            print(f"⚠️  Validation GT cache not found: {args.gt_cache_val}")
+            print(f"   Skipping validation.")
+    
+    if rank == 0:
+        print(f"✅ Train samples: {len(train_dataset)}")
+        if val_dataset is not None:
+            print(f"✅ Val samples: {len(val_dataset)}")
+        else:
+            print(f"⚠️  Val samples: 0 (skipped)")
+        print(f"✅ Effective batch size: {args.batch_size * args.accumulation_steps * world_size}")
+    
+    # Build dataloaders
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    ) if world_size > 1 else None
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=train_dataset.collate_fn,
+    )
+    
+    val_loader = None
+    val_sampler = None
+    if val_dataset is not None:
+        # 【重要】验证也需要 DistributedSampler，否则会导致 DDP 死锁
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+        ) if world_size > 1 else None
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=val_sampler,  # 使用分布式采样器
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=val_dataset.collate_fn,
+        )
+    
+    # Learning rate scheduler (account for gradient accumulation)
+    steps_per_epoch = len(train_loader) // args.accumulation_steps
+    scheduler = get_lr_scheduler(optimizer, args, steps_per_epoch)
+    
+    # Mixed precision scaler with very conservative settings
+    # 
+    # 【关键修复】大幅降低 init_scale
+    # 原因：总 loss ≈ 280-300，经 accumulation 后 loss_per_step ≈ 56
+    # 旧 scale=2048 时: scaled_loss = 56 × 2048 = 114,688
+    # LLM 权重是 FP16，梯度也是 FP16（max=65504）
+    # → 梯度极易溢出 → 每步都 NaN
+    #
+    # 新 scale=128 时: scaled_loss = 56 × 128 = 7,168
+    # 留有足够裕度，FP16 梯度不会溢出
+    # BF16 不需要 GradScaler：BF16 指数范围与 FP32 相同（max ~3.4e38），不存在溢出问题
+    # FP16 才需要 GradScaler 来防止梯度下溢（但不推荐，因为 7B LLM 反向传播容易溢出）
+    if args.fp16 and not args.bf16:
+        scaler = GradScaler(
+            init_scale=128.0,
+            growth_factor=1.5,
+            backoff_factor=0.5,
+            growth_interval=2000,
+        )
+        if rank == 0:
+            print("⚠️ 使用 FP16 GradScaler（不推荐，建议使用 --bf16）")
+    else:
+        scaler = None
+        if rank == 0 and args.bf16:
+            print("✅ 使用 BF16 混合精度训练（无需 GradScaler，不会梯度溢出）")
+    
+    # Resume from checkpoint if provided
+    start_epoch = 0
+    if args.resume is not None:
+        if rank == 0:
+            print(f"\nResuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        
+        # Handle module. prefix mismatch between checkpoint and model
+        state_dict = checkpoint['model_state_dict']
+        model_state_dict = model.state_dict()
+        
+        # Check if we need to add or remove 'module.' prefix
+        checkpoint_has_module = any(k.startswith('module.') for k in state_dict.keys())
+        model_has_module = any(k.startswith('module.') for k in model_state_dict.keys())
+        
+        if checkpoint_has_module and not model_has_module:
+            # Remove 'module.' prefix from checkpoint
+            state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+            if rank == 0:
+                print("  Removed 'module.' prefix from checkpoint keys")
+        elif not checkpoint_has_module and model_has_module:
+            # Add 'module.' prefix to checkpoint
+            state_dict = {'module.' + k: v for k, v in state_dict.items()}
+            if rank == 0:
+                print("  Added 'module.' prefix to checkpoint keys")
+        
+        model.load_state_dict(state_dict)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        
+        # Load EMA state if available
+        if ema is not None and 'ema_state_dict' in checkpoint:
+            ema.load_state_dict(checkpoint['ema_state_dict'])
+            if rank == 0:
+                print(f"✅ EMA state loaded")
+        
+        if rank == 0:
+            print(f"✅ Resumed from epoch {start_epoch}")
+    
+    # Training loop
+    if rank == 0:
+        print("\n" + "="*70)
+        print("Starting Training...")
+        print(f"  Gradient Accumulation: {args.accumulation_steps} steps")
+        print(f"  EMA: {'Enabled' if ema else 'Disabled'}")
+        print(f"  Mixed Precision: {'FP16' if args.fp16 else 'FP32'}")
+        print("="*70 + "\n")
+    
+    best_val_loss = float('inf')
+    best_mAP = 0.0
+    
+    for epoch in range(start_epoch, args.epochs):
+        if world_size > 1:
+            train_sampler.set_epoch(epoch)
+        
+        # Train
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, scheduler, scaler,
+            epoch, args, rank, ema=ema
+        )
+        
+        # Validate (skip if val_loader is None)
+        if val_loader is not None and (epoch + 1) % args.eval_interval == 0:
+            # 【优化】前 3 个 epoch 跳过 mAP 计算（mAP 计算在大数据集上极慢，O(pred×GT)）
+            # 前期模型随机，mAP 无意义且计算量爆炸（~25000 pred × 5000 GT × 3 class × 3 thresh）
+            # 只在 epoch 4 之后才计算 mAP
+            should_compute_map = (epoch + 1) >= 4
+            if rank == 0 and not should_compute_map:
+                print(f"[INFO] Epoch {epoch+1}: Skipping mAP computation (too slow for early epochs). "
+                      f"Will start computing mAP from epoch 4.", flush=True)
+            val_result = validate(model, val_loader, epoch, args, rank, ema=ema, 
+                                  compute_map=should_compute_map)
+            
+            # Handle both old (float) and new (tuple) return format
+            if isinstance(val_result, tuple):
+                val_loss, val_metrics = val_result
+                current_mAP = val_metrics.get('mAP', 0.0)
+            else:
+                val_loss = val_result
+                val_metrics = {}
+                current_mAP = 0.0
+            
+            # Save best model (based on mAP if available, otherwise loss)
+            if rank == 0:
+                # Use mAP as primary metric if available
+                if current_mAP > best_mAP:
+                    best_mAP = current_mAP
+                    best_val_loss = val_loss
+                    print(f"🎯 New best mAP: {best_mAP*100:.2f}%")
+                    save_checkpoint(
+                        base_model,
+                        optimizer, scheduler, epoch, args,
+                        'best_model.pth', ema=ema
+                    )
+                    # Also save EMA-only model for inference
+                    if ema is not None:
+                        save_ema_model(base_model, ema, args, 'best_model_ema.pth')
+                elif current_mAP == 0 and val_loss < best_val_loss:
+                    # Fallback to loss if mAP is 0
+                    best_val_loss = val_loss
+                    save_checkpoint(
+                        base_model,
+                        optimizer, scheduler, epoch, args,
+                        'best_model.pth', ema=ema
+                    )
+                    if ema is not None:
+                        save_ema_model(base_model, ema, args, 'best_model_ema.pth')
+        
+        # Save checkpoint
+        if rank == 0 and (epoch + 1) % args.save_interval == 0:
+            save_checkpoint(
+                base_model,
+                optimizer, scheduler, epoch, args,
+                f'checkpoint_epoch_{epoch+1}.pth', ema=ema
+            )
+    
+    # Save final model
+    if rank == 0:
+        save_checkpoint(
+            base_model,
+            optimizer, scheduler, args.epochs - 1, args,
+            'final_model.pth', ema=ema
+        )
+        
+        # Save EMA model for inference
+        if ema is not None:
+            save_ema_model(base_model, ema, args, 'final_model_ema.pth')
+        
+        print("\n" + "="*70)
+        print("✅ Training completed!")
+        print(f"  Best validation loss: {best_val_loss:.4f}")
+        print(f"  Best mAP: {best_mAP*100:.2f}%")
+        print(f"  Checkpoints saved to: {args.output_dir}")
+        print("="*70)
+    
+    # Cleanup
+    if world_size > 1:
+        dist.destroy_process_group()
+
+
+if __name__ == '__main__':
+    main()
+
