@@ -28,7 +28,7 @@ class MapEvaluator:
         self,
         num_classes: int = 3,
         cd_thresholds: List[float] = [0.5, 1.0, 1.5],
-        score_threshold: float = 0.1,  # 降低到 0.1，与 MapTR 更一致
+        score_threshold: float = 0.3,  # sigmoid(0)=0.5>0.1 导致全部通过，提高到 0.3 过滤低质预测
         pc_range: List[float] = [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0],
     ):
         """
@@ -132,8 +132,11 @@ class MapEvaluator:
         gt_points = gt_points.detach().cpu().numpy()
         gt_masks = gt_masks.detach().cpu().numpy()
         
-        # Get predictions (convert to float32 for softmax compatibility with FP16)
-        pred_probs = torch.softmax(pred_logits.float(), dim=-1)
+        # Get predictions
+        # IMPORTANT: training uses sigmoid focal (multi-label style, no explicit background class).
+        # Using softmax here forces every query to pick a class and inflates false positives.
+        # For evaluation we use sigmoid scores and take the best class per query.
+        pred_probs = pred_logits.float().sigmoid()  # [B, N, C]
         pred_scores, pred_labels = pred_probs.max(dim=-1)  # [B, N]
         pred_scores = pred_scores.numpy()
         pred_labels = pred_labels.numpy()
@@ -238,37 +241,45 @@ class MapEvaluator:
             sorted_preds = sorted_preds[:MAX_PREDS]
             num_pred = MAX_PREDS
         
-        # 【优化】预构建 GT 点矩阵 [num_gt, P, 2]，避免重复索引
-        gt_pts_all = np.stack([gt['points'] for gt in gt_list], axis=0)  # [num_gt, P, 2]
-        
-        # Track which GTs have been matched
-        gt_matched = np.zeros(num_gt, dtype=bool)
+        # Build per-sample GT pools.
+        # MapTR protocol matches predictions to GTs within the SAME sample only.
+        # Matching across different samples will severely distort AP/mAP.
+        gt_pts_by_sample = defaultdict(list)
+        for gt in gt_list:
+            gt_pts_by_sample[gt['sample_id']].append(gt['points'])
+        gt_pts_by_sample = {k: np.stack(v, axis=0) for k, v in gt_pts_by_sample.items()}  # sid -> [Mi, P, 2]
+
+        # Track matched GT per sample
+        gt_matched_by_sample = {sid: np.zeros(pts.shape[0], dtype=bool) for sid, pts in gt_pts_by_sample.items()}
         
         tp = np.zeros(num_pred)
         fp = np.zeros(num_pred)
         
         for i, pred in enumerate(sorted_preds):
             pred_pts = pred['points']  # [P, 2]
-            
-            # 找出未匹配的 GT 索引
-            unmatched_mask = ~gt_matched
-            unmatched_indices = np.where(unmatched_mask)[0]
-            
+
+            sid = pred['sample_id']
+            if sid not in gt_pts_by_sample:
+                fp[i] = 1
+                continue
+
+            gt_pts_all = gt_pts_by_sample[sid]  # [Mi, P, 2]
+            gt_matched = gt_matched_by_sample[sid]  # [Mi]
+
+            unmatched_indices = np.where(~gt_matched)[0]
             if len(unmatched_indices) == 0:
                 fp[i] = 1
                 continue
-            
-            # 【优化】批量计算 CD：一个 pred 与所有未匹配 GT
+
             unmatched_gt_pts = gt_pts_all[unmatched_indices]  # [M, P, 2]
             cds = self._compute_chamfer_distance_batch(pred_pts, unmatched_gt_pts)  # [M]
-            
-            # 找最小 CD
-            best_local_idx = np.argmin(cds)
-            min_cd = cds[best_local_idx]
-            
+
+            best_local_idx = int(np.argmin(cds))
+            min_cd = float(cds[best_local_idx])
+
             if min_cd < cd_threshold:
-                best_gt_idx = unmatched_indices[best_local_idx]
-                gt_matched[best_gt_idx] = True
+                best_gt_local = unmatched_indices[best_local_idx]
+                gt_matched[best_gt_local] = True
                 tp[i] = 1
             else:
                 fp[i] = 1

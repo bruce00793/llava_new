@@ -1,0 +1,72 @@
+=== Epoch 1 (epoch_field=0, sched_step=470) ===
+    qformer_backbone: lr=1.92e-06
+    qformer_decoder: lr=4.79e-06
+    qformer_projector: lr=1.92e-05
+    map_queries: lr=4.79e-05
+    map_decoder: lr=1.92e-05
+    scene_interaction: lr=1.92e-05
+    lora: lr=9.59e-05
+
+=== Epoch 2 (epoch_field=1, sched_step=939) ===
+    qformer_backbone: lr=1.99e-06
+    qformer_decoder: lr=4.98e-06
+    qformer_projector: lr=1.99e-05
+    map_queries: lr=4.98e-05
+    map_decoder: lr=1.99e-05
+    scene_interaction: lr=1.99e-05
+    lora: lr=9.96e-05
+
+=== Epoch 3 (epoch_field=2, sched_step=1408) ===
+    qformer_backbone: lr=1.96e-06
+    qformer_decoder: lr=4.91e-06
+    qformer_projector: lr=1.96e-05
+    map_queries: lr=4.91e-05
+    map_decoder: lr=1.96e-05
+    scene_interaction: lr=1.96e-05
+    lora: lr=9.82e-05
+
+=== Epoch 4 (epoch_field=3, sched_step=1877) ===
+    qformer_backbone: lr=1.92e-06
+    qformer_decoder: lr=4.80e-06
+    qformer_projector: lr=1.92e-05
+    map_queries: lr=4.80e-05
+    map_decoder: lr=1.92e-05
+    scene_interaction: lr=1.92e-05
+    lora: lr=9.60e-05
+
+=== Epoch 5 (epoch_field=4, sched_step=2346) ===
+    qformer_backbone: lr=1.86e-06
+    qformer_decoder: lr=4.64e-06
+    qformer_projector: lr=1.86e-05
+    map_queries: lr=4.64e-05
+    map_decoder: lr=1.86e-05
+    scene_interaction: lr=1.86e-05
+    lora: lr=9.29e-05
+
+=== Epoch 6 (epoch_field=5, sched_step=2815) ===
+    qformer_backbone: lr=1.78e-06
+    qformer_decoder: lr=4.45e-06
+    qformer_projector: lr=1.78e-05
+    map_queries: lr=4.45e-05
+    map_decoder: lr=1.78e-05
+    scene_interaction: lr=1.78e-05
+    lora: lr=8.90e-05
+
+=== Epoch 7 (epoch_field=6, sched_step=3284) ===
+    qformer_backbone: lr=1.69e-06
+    qformer_decoder: lr=4.22e-06
+    qformer_projector: lr=1.69e-05
+    map_queries: lr=4.22e-05
+    map_decoder: lr=1.69e-05
+    scene_interaction: lr=1.69e-05
+    lora: lr=8.43e-05
+
+=== Epoch 8 (epoch_field=7, sched_step=3753) ===
+    qformer_backbone: lr=1.58e-06
+    qformer_decoder: lr=3.95e-06
+    qformer_projector: lr=1.58e-05
+    map_queries: lr=3.95e-05
+    map_decoder: lr=1.58e-05
+    scene_interaction: lr=1.58e-05
+    lora: lr=7.90e-05
+

@@ -124,6 +124,11 @@ class PointFeatureReducer(nn.Module):
 class ClassificationHead(nn.Module):
     """
     Classification head: predict class logits from instance features
+    
+    【修复】添加 DETR/MapTR 标准的先验偏置初始化：
+    - prior_prob = 0.01 → bias = -log((1-0.01)/0.01) ≈ -4.595
+    - 初始 sigmoid ≈ 0.01（强先验："大部分 query 是背景"）
+    - 防止训练初期的 "全背景" 模式坍塌
     """
     def __init__(self, config: MapDetectionConfig = DEFAULT_MAP_CONFIG):
         super().__init__()
@@ -134,6 +139,14 @@ class ClassificationHead(nn.Module):
             nn.Linear(config.SHARED_FEATURE_DIM, config.CLS_OUTPUT_DIM),
         )
         
+        # 【DETR 标准】先验偏置初始化
+        # 设 prior_prob=0.01，让初始预测倾向于 "背景"
+        # 这让 focal loss 对正样本产生更强的梯度信号，帮助匹配学习
+        prior_prob = 0.01
+        bias_value = -math.log((1 - prior_prob) / prior_prob)  # ≈ -4.595
+        nn.init.constant_(self.head[-1].bias, bias_value)
+        nn.init.xavier_uniform_(self.head[-1].weight)
+        
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         logits = self.head(features)
         logits = torch.clamp(logits, min=-50.0, max=50.0)
@@ -142,16 +155,25 @@ class ClassificationHead(nn.Module):
 
 class InitPointsHead(nn.Module):
     """
-    从 Instance Features 和 Point Features 共同预测 20 个点的初始位置
+    从 Instance Features 和 Point Features 预测 20 个点的初始位置
     
-    优化设计:
-    - 不再只依赖 inst_features "盲猜"初始点
-    - 融合 point_features（LLM 为每个点学到的信息）
-    - inst_features 提供全局布局，point_features 提供点级别的定位信息
+    【P0修复】锚点 + 偏移设计，彻底防止模式坍塌：
+    - 维护固定的均匀锚点（register_buffer，不参与训练）
+    - 模型只预测相对于锚点的偏移量（范围受 tanh 限制为 ±0.5）
+    - 即使偏移预测坍塌为 0，锚点仍保证 20 个点均匀分布
+    - 最后一层零初始化，确保训练初期从均匀锚点出发
     """
     def __init__(self, inst_dim: int = 256, point_dim: int = 256, num_points: int = 20):
         super().__init__()
         self.num_points = num_points
+        
+        # 【P0修复核心】固定均匀锚点 — 防止模式坍塌
+        # 20 个点沿 y 轴均匀分布（y 是 BEV 的长轴 [-30,30]m）
+        # 即使偏移预测完全坍塌为 0，这些锚点也保证点不会重合
+        anchors = torch.zeros(num_points, 2)
+        anchors[:, 0] = 0.0  # x 方向居中
+        anchors[:, 1] = torch.linspace(-0.8, 0.8, num_points)  # y 方向均匀分布
+        self.register_buffer('anchors', anchors)  # (P, 2), 不参与训练
         
         # 投影 point_features：提取每个点的定位倾向
         self.point_proj = nn.Sequential(
@@ -169,15 +191,20 @@ class InitPointsHead(nn.Module):
             nn.Dropout(0.1),
         )
         
-        # 融合后预测坐标
-        # 64 (point) + 64 (inst) = 128 → 每个点单独预测坐标
+        # 融合后预测偏移量（不是绝对坐标！）
+        # 64 (point) + 64 (inst) = 128 → 每个点预测 (dx, dy) 偏移
         self.coord_head = nn.Sequential(
             nn.LayerNorm(128),
             nn.Linear(128, 64),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
-            nn.Linear(64, 2),  # 每个点预测 (x, y)
+            nn.Linear(64, 2),  # 预测 (dx, dy) 偏移量
         )
+        
+        # 【关键】零初始化最后一层，确保训练初期偏移量 ≈ 0
+        # 这样模型一开始就从均匀锚点出发，而不是随机位置
+        nn.init.zeros_(self.coord_head[-1].weight)
+        nn.init.zeros_(self.coord_head[-1].bias)
     
     def forward(
         self, 
@@ -203,13 +230,21 @@ class InitPointsHead(nn.Module):
         # Step 3: 融合
         fused = torch.cat([pt_proj, inst_proj], dim=-1)  # (B, N, P, 128)
         
-        # Step 4: 预测每个点的坐标
-        # reshape → MLP → reshape
+        # Step 4: 预测偏移量（不是绝对坐标）
         fused_flat = fused.reshape(-1, 128)
-        coords_flat = self.coord_head(fused_flat)  # (B*N*P, 2)
-        coords = coords_flat.reshape(B, N, P, 2)
+        offsets_flat = self.coord_head(fused_flat)  # (B*N*P, 2)
+        offsets = offsets_flat.reshape(B, N, P, 2)
         
-        # Step 5: 限制范围
+        # Step 5: 限制偏移范围（tanh * 0.5，最大偏移 ±0.5）
+        # 这保证了即使模型"想"把所有点拉到同一位置，
+        # 锚点间距 0.084 (1.6/19) > 偏移无法完全抵消的最小间距
+        offsets = torch.tanh(offsets) * 0.5
+        
+        # Step 6: 锚点 + 偏移 = 初始点
+        # anchors: (P, 2) → (1, 1, P, 2) → 广播到 (B, N, P, 2)
+        coords = self.anchors.unsqueeze(0).unsqueeze(0) + offsets
+        
+        # Step 7: 限制在 [-1, 1]
         coords = coords.clamp(-1.0, 1.0)
         
         return coords

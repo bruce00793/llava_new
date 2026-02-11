@@ -53,8 +53,10 @@ wandb/
 *.bin
 *.safetensors
 *.h5
+*.hdf5
 *.pt
 *.pth
+*.ckpt
 *.pkl
 *.tgz
 *.tar.gz

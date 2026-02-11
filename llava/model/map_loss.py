@@ -64,7 +64,9 @@ class HungarianMatcher(nn.Module):
         _, _, P, _ = pred_lines.shape
         
         # Convert to probabilities
-        pred_probs = pred_logits.softmax(dim=-1)  # [B, N, num_classes]
+        # IMPORTANT: training uses sigmoid focal loss (use_sigmoid=True style, no explicit background logit).
+        # Using softmax here forces competition between classes and can distort the matching cost.
+        pred_probs = pred_logits.sigmoid()  # [B, N, num_classes]
         
         indices = []
         
@@ -568,8 +570,11 @@ class MapDetectionLoss(nn.Module):
         if num_total_pos == 0:
             return pred_lines.sum() * 0.0  # Return zero with gradient
         
-        # 归一化：除以实例数（Following MapTR）
-        total_loss = sum(all_diff) / max(num_total_pos, 1.0)
+        # 归一化：除以实例数 × 点数（Following MapTR）
+        # 【修复】旧代码只除以实例数，导致 loss 膨胀 P=20 倍
+        # 正确做法：对每个实例的 P 个点取平均，再对实例取平均
+        num_points = pred_lines.shape[2]  # P = 20
+        total_loss = sum(all_diff) / (max(num_total_pos, 1.0) * num_points)
         
         return total_loss
     
@@ -664,8 +669,11 @@ class MapDetectionLoss(nn.Module):
         if num_total_pos == 0:
             return pred_lines.sum() * 0.0  # Return zero with gradient
         
-        # 归一化：除以实例数（Following MapTR）
-        total_loss = sum(all_dir_loss) / max(num_total_pos, 1.0)
+        # 归一化：除以实例数 × 边数（Following MapTR）
+        # 【修复】旧代码只除以实例数，导致 loss 膨胀 (P-1)=19 倍
+        # 正确做法：对每个实例的 (P-1) 条边取平均，再对实例取平均
+        num_edges = pred_lines.shape[2] - 1  # P-1 = 19
+        total_loss = sum(all_dir_loss) / (max(num_total_pos, 1.0) * num_edges)
         
         return total_loss
 

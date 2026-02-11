@@ -124,6 +124,8 @@ def parse_args():
                         help='Path to train GT cache (if None, will auto-generate)')
     parser.add_argument('--gt-cache-val', type=str, default=None,
                         help='Path to val GT cache (if None, will auto-generate)')
+    parser.add_argument('--subset-scenes', type=str, default=None,
+                        help='Path to scene name list file for subset training (e.g., data/subset_15pct_scenes.txt)')
     
     # Model
     parser.add_argument('--llm-path', type=str, default='lmsys/vicuna-7b-v1.5',
@@ -131,39 +133,51 @@ def parse_args():
     parser.add_argument('--qformer-pretrained', type=str, default='blip2',
                         choices=['blip2', 'none'],
                         help='Q-Former pretrained weights (blip2 or none)')
+    parser.add_argument('--qformer-version', type=str, default='v1',
+                        choices=['v1', 'v2'],
+                        help='Q-Former version: v1=原版(BLIP-2), v2=三阶段双流')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     
     # Training
     parser.add_argument('--epochs', type=int, default=24,
                         help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=4,
-                        help='Batch size per GPU')
-    parser.add_argument('--accumulation-steps', type=int, default=4,
-                        help='Gradient accumulation steps (effective batch = batch_size * accumulation)')
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Batch size per GPU（P3修复：降低到1以提高梯度累积步数）')
+    parser.add_argument('--accumulation-steps', type=int, default=10,
+                        help='Gradient accumulation steps（P3修复：10→effective_batch=60）')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of data loading workers')
     
-    # Fine-grained learning rates
-    parser.add_argument('--lr-qformer-backbone', type=float, default=5e-6,
-                        help='Learning rate for Q-Former backbone (minimal change)')
-    parser.add_argument('--lr-qformer-decoder', type=float, default=1e-5,
-                        help='Learning rate for Q-Former decoder (fine-tune)')
-    parser.add_argument('--lr-qformer-projector', type=float, default=5e-5,
+    # Fine-grained learning rates（P1修复：降低学习率，稳定训练）
+    # 
+    # 【P1修复】学习率策略调整：
+    # - 旧方案：lr_decoder=1e-4，loss≈280 → 单步更新过大 → 12000次梯度爆炸
+    # - 新方案：lr_decoder=2e-5（降低5×），配合更严格的梯度裁剪
+    # - 原因：loss 未归一化（MapTR loss≈1-2，我们≈200-300），需要更小的 lr
+    parser.add_argument('--lr-qformer-backbone', type=float, default=2e-6,
+                        help='Learning rate for Q-Former backbone (pre-trained, minimal change)')
+    parser.add_argument('--lr-qformer-decoder', type=float, default=5e-6,
+                        help='Learning rate for Q-Former decoder (pre-trained, fine-tune)')
+    parser.add_argument('--lr-qformer-projector', type=float, default=3e-5,
                         help='Learning rate for Q-Former projector (adapt to new task)')
     parser.add_argument('--lr-queries', type=float, default=1e-4,
                         help='Learning rate for Map Queries (train from scratch)')
-    parser.add_argument('--lr-decoder', type=float, default=1e-4,
-                        help='Learning rate for Map Decoder (train from scratch)')
-    parser.add_argument('--lr-lora', type=float, default=2e-4,
+    parser.add_argument('--lr-decoder', type=float, default=5e-5,
+                        help='Learning rate for Map Decoder excluding cls_head (train from scratch)')
+    parser.add_argument('--lr-cls-head', type=float, default=5e-4,
+                        help='Learning rate for Classification Head (独立高LR, MapTR级别)')
+    parser.add_argument('--lr-lora', type=float, default=1e-4,
                         help='Learning rate for LoRA parameters (fine-tuning LLM attention)')
+    parser.add_argument('--lr-scene-interaction', type=float, default=5e-5,
+                        help='Learning rate for Map-Scene Interaction Layer (train from scratch)')
     
     parser.add_argument('--weight-decay', type=float, default=0.01,
                         help='Weight decay')
     parser.add_argument('--warmup-steps', type=int, default=500,
                         help='Number of warmup steps')
-    parser.add_argument('--grad-clip', type=float, default=5.0,
-                        help='Gradient clipping (MapTR uses 35.0, 5.0 is more conservative)')
+    parser.add_argument('--grad-clip', type=float, default=1.0,
+                        help='Gradient clipping（P1修复：从5.0降低到1.0，更严格控制）')
     
     # EMA
     parser.add_argument('--use-ema', action='store_true', default=True,
@@ -237,9 +251,10 @@ def build_optimizer(model, args):
     qformer_projector_params = [] # projector to LLM dim
     qformer_other_params = []     # query_embed, camera_embed, position_encoding
     queries_params = []           # instance_queries, point_queries
-    decoder_params = []           # feature_reducer, cls_head, points_head
+    cls_head_params = []          # 【新增】分类头独立参数组（需要高 LR）
+    decoder_params = []           # feature_reducer, points_head（不含 cls_head）
     scene_interaction_params = [] # map_scene_interaction module
-    lora_params = []              # LoRA parameters (新增!)
+    lora_params = []              # LoRA parameters
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -261,30 +276,31 @@ def build_optimizer(model, args):
         elif 'map_queries' in name:
             queries_params.append(param)
         
-        # Map Scene Interaction parameters (train from scratch, use decoder lr)
+        # Map Scene Interaction parameters (train from scratch)
         elif 'map_scene_interaction' in name:
             scene_interaction_params.append(param)
         
-        # Map Decoder parameters
+        # 【关键】分类头独立分组（需要 MapTR 级别高 LR）
+        elif 'decoder' in name and 'cls_head' in name:
+            cls_head_params.append(param)
+        
+        # Map Decoder parameters（不含 cls_head）
         elif 'decoder' in name:
             decoder_params.append(param)
         
-        # LoRA parameters (必须在 'llm' 检查之前!)
+        # LoRA parameters（必须在 'llm' 检查之前!）
         elif 'lora_' in name:
             lora_params.append(param)
         
         # Skip frozen LLM parameters (lm_head etc.)
-        # 注意: LoRA 参数已在上面处理，这里只跳过真正冻结的参数
         elif 'llm' in name:
-            # 如果走到这里且 requires_grad=True，说明是意外情况
             print(f"Warning: Unexpected trainable LLM parameter (not LoRA): {name}")
             continue
         
         else:
-            # Should not happen if freeze_llm=True
             print(f"Warning: Unexpected trainable parameter: {name}")
     
-    # Combine qformer_other with decoder (similar learning rate)
+    # Combine qformer_other with qformer_decoder (similar learning rate)
     qformer_decoder_params.extend(qformer_other_params)
     
     # Create parameter groups with different learning rates
@@ -318,6 +334,13 @@ def build_optimizer(model, args):
             'name': 'map_queries',
         })
     
+    if cls_head_params:
+        param_groups.append({
+            'params': cls_head_params,
+            'lr': args.lr_cls_head,
+            'name': 'cls_head',
+        })
+    
     if decoder_params:
         param_groups.append({
             'params': decoder_params,
@@ -328,7 +351,7 @@ def build_optimizer(model, args):
     if scene_interaction_params:
         param_groups.append({
             'params': scene_interaction_params,
-            'lr': args.lr_decoder,  # Use same lr as decoder (train from scratch)
+            'lr': args.lr_scene_interaction,  # 与 decoder 对齐（从 scratch 训练）
             'name': 'scene_interaction',
         })
     
@@ -397,7 +420,7 @@ def get_lr_scheduler(optimizer, args, steps_per_epoch):
     return scheduler
 
 
-def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args, rank, ema=None):
+def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args, rank, local_rank=0, ema=None):
     """
     Train for one epoch with gradient accumulation and EMA.
     
@@ -410,13 +433,30 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
         epoch: Current epoch number
         args: Training arguments
         rank: Process rank for distributed training
+        local_rank: Local rank (GPU index) for CUDA device
         ema: EMA object (optional)
+    
+    Returns:
+        dict: {
+            'avg_loss': float,
+            'loss_components': {key: avg_value},
+            'loss_curve': [{step, total_loss, cls, pts, dir, grad_norm, lr}],
+            'grad_stats': {avg, max, min, clipped_steps, total_steps, clip_ratio},
+        }
     """
     model.train()
     
     total_loss = 0.0
     loss_dict_accum = {}
     num_updates = 0
+    
+    # ===== 训练日志：稀疏损失曲线 + 梯度统计 =====
+    SAMPLE_INTERVAL = 200  # 每 200 步采样一次
+    loss_curve_samples = []  # 稀疏损失曲线
+    grad_norms_all = []      # 所有更新步的梯度范数（裁剪前）
+    clipped_steps = 0        # 被裁剪的步数（grad_norm > grad_clip）
+    nan_skipped_steps = 0    # NaN 跳过的步数
+    oom_skipped_steps = 0    # OOM 跳过的步数
     
     # Gradient accumulation setup
     accumulation_steps = args.accumulation_steps
@@ -437,23 +477,44 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
         # detect_anomaly 已完成调试任务（已定位 NaN 来源为 CoordinateEncoder 频率过高）
         # 正常训练中不再启用（会显著减慢速度且在 DDP 中可能导致崩溃）
         
-        # Forward with mixed precision
+        # Forward with mixed precision + OOM 保护
         use_amp = args.bf16 or args.fp16
         amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
-        with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-            output = model(
-                images=images,
-                text_ids=text_ids,
-                return_loss=True,
-                gt_labels=gt_labels,
-                gt_points=gt_points,
-                gt_masks=gt_masks,
-                cam_intrinsics=cam_intrinsics,
-                cam_extrinsics=cam_extrinsics,
-            )
-            
-            loss = output['loss'].float() / accumulation_steps
-            loss_dict = output['loss_dict']
+        
+        oom_flag = False
+        try:
+            with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                output = model(
+                    images=images,
+                    text_ids=text_ids,
+                    return_loss=True,
+                    gt_labels=gt_labels,
+                    gt_points=gt_points,
+                    gt_masks=gt_masks,
+                    cam_intrinsics=cam_intrinsics,
+                    cam_extrinsics=cam_extrinsics,
+                )
+                
+                loss = output['loss'].float() / accumulation_steps
+                loss_dict = output['loss_dict']
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                if rank == 0:
+                    print(f"⚠️ CUDA OOM at Epoch {epoch+1} Step {step+1}, clearing cache and skipping batch", flush=True)
+                torch.cuda.empty_cache()
+                optimizer.zero_grad()
+                oom_flag = True
+            else:
+                raise e  # 非 OOM 错误，正常抛出
+        
+        # OOM 时同步所有 GPU 跳过此 batch
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            oom_sync = torch.tensor([1.0 if oom_flag else 0.0], device=f'cuda:{local_rank}')
+            dist.all_reduce(oom_sync, op=dist.ReduceOp.MAX)
+            oom_flag = oom_sync.item() > 0
+        if oom_flag:
+            oom_skipped_steps += 1
+            continue
         
         # ========== NaN 检测和同步跳过 ==========
         # 检测 loss 是否为 NaN 或 Inf
@@ -470,6 +531,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
             if rank == 0:
                 print(f"⚠️ NaN/Inf detected at Epoch {epoch+1} Step {step+1}, skipping this batch (all GPUs synced)")
             optimizer.zero_grad()
+            nan_skipped_steps += 1
             continue
         
         # Backward (accumulate gradients)
@@ -496,10 +558,12 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
         # Update weights every accumulation_steps
         if (step + 1) % accumulation_steps == 0:
             skip_optimizer_step = False
+            current_grad_norm = 0.0
             
             if args.fp16 and scaler is not None:
                 scaler.unscale_(optimizer)
                 grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                current_grad_norm = grad_norm_before.item() if torch.isfinite(grad_norm_before) else float('nan')
                 
                 if not torch.isfinite(grad_norm_before):
                     if rank == 0:
@@ -509,6 +573,8 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
                     scaler.update()
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    if grad_norm_before.item() > args.grad_clip:
+                        clipped_steps += 1
                     if rank == 0 and grad_norm_before > args.grad_clip * 10:
                         print(f"⚠️ [Step {step+1}] Large gradient detected! "
                               f"Norm before clip: {grad_norm_before:.2f}", flush=True)
@@ -517,6 +583,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
             else:
                 # BF16 或 FP32 模式 — 不需要 GradScaler
                 grad_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                current_grad_norm = grad_norm_before.item() if torch.isfinite(grad_norm_before) else float('nan')
                 
                 if not torch.isfinite(grad_norm_before):
                     if rank == 0:
@@ -540,6 +607,8 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
                     optimizer.zero_grad()
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    if grad_norm_before.item() > args.grad_clip:
+                        clipped_steps += 1
                     if rank == 0 and grad_norm_before > args.grad_clip * 10:
                         print(f"⚠️ [Step {step+1}] Large gradient detected! "
                               f"Norm before clip: {grad_norm_before:.2f}", flush=True)
@@ -549,6 +618,9 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
                 optimizer.zero_grad()
                 scheduler.step()
                 num_updates += 1
+                # 记录有效更新步的梯度范数
+                if not (current_grad_norm != current_grad_norm):  # not NaN
+                    grad_norms_all.append(current_grad_norm)
             
             # Update EMA
             if ema is not None:
@@ -575,6 +647,25 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
                 for key, value in loss_dict.items():
                     avg_value = loss_dict_accum[key] / (step + 1)
                     print(f"    {key}: {value.item():.4f} (Avg: {avg_value:.4f})")
+        
+        # ===== 稀疏损失曲线采样（每 200 步，仅 rank 0）=====
+        if rank == 0 and (step + 1) % SAMPLE_INTERVAL == 0:
+            sample_point = {
+                "步数": step + 1,
+                "总损失": round(loss.item() * accumulation_steps, 4),
+            }
+            # 记录各项损失分量
+            for key, value in loss_dict.items():
+                # 只保留核心损失项，跳过辅助损失的逐层细节
+                if key in ('loss_cls', 'loss_pts', 'loss_dir', 'loss_main', 'loss_aux_total'):
+                    short_key = key.replace('loss_', '')
+                    sample_point[short_key] = round(value.item(), 4)
+            # 最近一次的梯度范数
+            if grad_norms_all:
+                sample_point["梯度范数"] = round(grad_norms_all[-1], 2)
+            # 当前学习率（取第一个参数组，转为 float 防止 JSON 序列化失败）
+            sample_point["学习率"] = float(optimizer.param_groups[0]['lr'])
+            loss_curve_samples.append(sample_point)
     
     # Handle remaining gradients (if not divisible by accumulation_steps)
     remaining = len(dataloader) % accumulation_steps
@@ -613,7 +704,12 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
             ema.update()
     
     # Epoch summary
-    avg_loss = total_loss / len(dataloader)  # 所有 rank 都计算
+    avg_loss = total_loss / max(len(dataloader), 1)  # 所有 rank 都计算
+    
+    # 构建各项损失平均值
+    loss_components = {}
+    for key, value in loss_dict_accum.items():
+        loss_components[key] = round(value / max(len(dataloader), 1), 4)
     
     if rank == 0:
         print(f"\n{'='*70}")
@@ -621,8 +717,12 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
         print(f"  Average Loss: {avg_loss:.4f}")
         print(f"  Total Updates: {num_updates}")
         print(f"  Effective Samples: {len(dataloader) * args.batch_size}")
-        for key, value in loss_dict_accum.items():
-            print(f"  {key}: {value / len(dataloader):.4f}")
+        for key, value in loss_components.items():
+            print(f"  {key}: {value:.4f}")
+        if grad_norms_all:
+            print(f"  Grad Norm (avg/max/min): {sum(grad_norms_all)/len(grad_norms_all):.2f} / {max(grad_norms_all):.2f} / {min(grad_norms_all):.2f}")
+            print(f"  Clipped steps: {clipped_steps}/{len(grad_norms_all)} ({100*clipped_steps/max(len(grad_norms_all),1):.1f}%)")
+        print(f"  NaN skipped: {nan_skipped_steps}, OOM skipped: {oom_skipped_steps}")
         print(f"{'='*70}\n")
     
     # 【重要】训练完成后同步所有 GPU，防止某些 GPU 提前进入 validation
@@ -633,7 +733,37 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, epoch, args
         if rank == 0:
             print(f"[DEBUG] All GPUs finished training epoch {epoch+1}!", flush=True)
     
-    return avg_loss
+    # ===== 构建训练日志返回值 =====
+    # 梯度统计
+    grad_stats = {}
+    if grad_norms_all:
+        grad_stats = {
+            "平均": round(sum(grad_norms_all) / len(grad_norms_all), 2),
+            "最大": round(max(grad_norms_all), 2),
+            "最小": round(min(grad_norms_all), 2),
+            "被裁剪步数": clipped_steps,
+            "有效更新步数": len(grad_norms_all),
+            "裁剪比例": round(clipped_steps / max(len(grad_norms_all), 1), 4),
+        }
+    
+    # 当前各参数组学习率（转 float 防止 JSON 序列化失败）
+    current_lrs = {}
+    for group in optimizer.param_groups:
+        name = group.get('name', 'unknown')
+        current_lrs[name] = float(group['lr'])
+    
+    train_log = {
+        "平均总损失": round(avg_loss, 4),
+        "各项损失": loss_components,
+        "损失下降曲线": loss_curve_samples,
+        "梯度统计": grad_stats,
+        "当前学习率": current_lrs,
+        "有效更新步数": num_updates,
+        "NaN跳过步数": nan_skipped_steps,
+        "OOM跳过步数": oom_skipped_steps,
+    }
+    
+    return train_log
 
 
 @torch.no_grad()
@@ -759,11 +889,76 @@ def validate(model, dataloader, epoch, args, rank, ema=None, compute_map=True):
         if rank == 0:
             print(f"[DEBUG] All GPUs finished validation loop!", flush=True)
     
-    # Compute metrics
-    avg_loss = total_loss / max(len(dataloader), 1)
-    metrics = {}
+    # ========== 分布式汇总：损失 + mAP 预测 ==========
+    local_steps = len(dataloader)
     
-    if evaluator is not None:
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        world_size_val = dist.get_world_size()
+        
+        # --- 1. 汇总验证损失（所有 GPU → 求和 → 除以总步数）---
+        loss_agg = torch.tensor([total_loss, float(local_steps)], device='cuda')
+        dist.all_reduce(loss_agg, op=dist.ReduceOp.SUM)
+        total_loss = loss_agg[0].item()
+        total_steps_all = int(loss_agg[1].item())
+        
+        for key in loss_dict_accum:
+            val_tensor = torch.tensor(loss_dict_accum[key], device='cuda')
+            dist.all_reduce(val_tensor, op=dist.ReduceOp.SUM)
+            loss_dict_accum[key] = val_tensor.item()
+        
+        # --- 2. 汇总 mAP 预测结果到 rank 0 ---
+        # 每个 GPU 只看到 1/world_size 的验证集
+        # 需要把所有 GPU 的预测和 GT 汇总到 rank 0 计算完整 mAP
+        if evaluator is not None:
+            if rank == 0:
+                print(f"[DEBUG] Gathering mAP predictions from {world_size_val} GPUs...", flush=True)
+            
+            # Step 1: 为每个 GPU 的 sample_id 添加偏移，防止冲突
+            # 各 GPU 的 sample_id 都从 0 开始，加上 rank * 100000 使全局唯一
+            offset = rank * 100000
+            for cls_id in evaluator.pred_instances:
+                for pred in evaluator.pred_instances[cls_id]:
+                    pred['sample_id'] += offset
+            for cls_id in evaluator.gt_instances:
+                for gt in evaluator.gt_instances[cls_id]:
+                    gt['sample_id'] += offset
+            
+            # Step 2: 序列化每个 GPU 的评估数据
+            local_eval_data = {
+                'pred_instances': dict(evaluator.pred_instances),
+                'gt_instances': dict(evaluator.gt_instances),
+                'sample_count': evaluator.sample_count,
+            }
+            
+            # Step 3: 汇总到 rank 0（使用 gather_object，内部用 pickle 处理 numpy）
+            gathered_eval = [None] * world_size_val if rank == 0 else None
+            dist.gather_object(local_eval_data, gathered_eval, dst=0)
+            
+            # Step 4: rank 0 合并所有数据到新的 evaluator
+            if rank == 0:
+                merged_evaluator = MapEvaluator()
+                total_sample_count = 0
+                for gpu_data in gathered_eval:
+                    for cls_id, preds in gpu_data['pred_instances'].items():
+                        merged_evaluator.pred_instances[cls_id].extend(preds)
+                    for cls_id, gts in gpu_data['gt_instances'].items():
+                        merged_evaluator.gt_instances[cls_id].extend(gts)
+                    total_sample_count += gpu_data['sample_count']
+                merged_evaluator.sample_count = total_sample_count
+                evaluator = merged_evaluator
+                print(f"[DEBUG] Merged evaluator: {total_sample_count} samples "
+                      f"from {world_size_val} GPUs", flush=True)
+    else:
+        total_steps_all = local_steps
+    
+    # Compute metrics
+    avg_loss = total_loss / max(total_steps_all, 1)
+    val_loss_components = {}
+    for key, value in loss_dict_accum.items():
+        val_loss_components[key] = round(value / max(total_steps_all, 1), 4)
+    
+    metrics = {}
+    if evaluator is not None and rank == 0:
         metrics = evaluator.compute_metrics()
     
     # Print results
@@ -772,8 +967,8 @@ def validate(model, dataloader, epoch, args, rank, ema=None, compute_map=True):
         print(f"\n{'='*70}")
         print(f"Validation Epoch {epoch+1}{ema_str}:")
         print(f"  Average Loss: {avg_loss:.4f}")
-        for key, value in loss_dict_accum.items():
-            print(f"  {key}: {value / len(dataloader):.4f}")
+        for key, value in val_loss_components.items():
+            print(f"  {key}: {value:.4f}")
         
         # Print mAP metrics
         if metrics:
@@ -794,10 +989,52 @@ def validate(model, dataloader, epoch, args, rank, ema=None, compute_map=True):
         
         print(f"{'='*70}\n")
     
+    # ===== 构建验证日志 =====
+    val_log = {
+        "平均总损失": round(avg_loss, 4),
+        "各项损失": val_loss_components,
+    }
+    
+    if metrics:
+        # mAP 汇总
+        mAP_log = {
+            "综合mAP": round(metrics.get('mAP', 0.0) * 100, 2),
+        }
+        # 各阈值 mAP
+        for thresh in [0.5, 1.0, 1.5]:
+            key = f'mAP@{thresh}m'
+            if key in metrics:
+                mAP_log[f"mAP@{thresh}m"] = round(metrics[key] * 100, 2)
+        
+        # 各类别各阈值 AP
+        per_class = {}
+        for cls_name in ['divider', 'ped_crossing', 'boundary']:
+            cls_aps = {}
+            for thresh in [0.5, 1.0, 1.5]:
+                ap_key = f'AP_{cls_name}@{thresh}m'
+                if ap_key in metrics:
+                    cls_aps[f"AP@{thresh}m"] = round(metrics[ap_key] * 100, 2)
+            if cls_aps:
+                per_class[cls_name] = cls_aps
+        mAP_log["各类别AP"] = per_class
+        
+        # 预测和GT数量
+        counts = {}
+        for cls_name in ['divider', 'ped_crossing', 'boundary']:
+            pred_key = f'num_pred_{cls_name}'
+            gt_key = f'num_gt_{cls_name}'
+            if pred_key in metrics:
+                counts[f"{cls_name}_预测数"] = int(metrics[pred_key])
+            if gt_key in metrics:
+                counts[f"{cls_name}_标注数"] = int(metrics[gt_key])
+        mAP_log["预测与标注数量"] = counts
+        
+        val_log["mAP"] = mAP_log
+    
     if compute_map:
-        return avg_loss, metrics
+        return avg_loss, metrics, val_log
     else:
-        return avg_loss
+        return avg_loss, {}, val_log
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, args, filename, ema=None):
@@ -870,6 +1107,40 @@ def main():
         # Save config
         with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
             json.dump(vars(args), f, indent=2)
+        
+        # ===== 初始化 training_log.json =====
+        training_log_path = os.path.join(args.output_dir, 'training_log.json')
+        training_log = {
+            "项目": "LLaVA Map Detection",
+            "创建时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "配置": {
+                "总轮数": args.epochs,
+                "每GPU_batch_size": args.batch_size,
+                "梯度累积步数": args.accumulation_steps,
+                "有效batch_size": args.batch_size * args.accumulation_steps * world_size,
+                "GPU数量": world_size,
+                "混合精度": "BF16" if args.bf16 else ("FP16" if args.fp16 else "FP32"),
+                "梯度裁剪": args.grad_clip,
+                "权重衰减": args.weight_decay,
+                "warmup步数": args.warmup_steps,
+                "EMA": args.use_ema,
+                "EMA衰减": args.ema_decay if args.use_ema else None,
+                "学习率": {
+                    "qformer_backbone": args.lr_qformer_backbone,
+                    "qformer_decoder": args.lr_qformer_decoder,
+                    "qformer_projector": args.lr_qformer_projector,
+                    "map_queries": args.lr_queries,
+                    "cls_head": args.lr_cls_head,
+                    "map_decoder": args.lr_decoder,
+                    "scene_interaction": args.lr_scene_interaction,
+                    "lora": args.lr_lora,
+                },
+            },
+            "epochs": [],
+        }
+        with open(training_log_path, 'w', encoding='utf-8') as f:
+            json.dump(training_log, f, indent=2, ensure_ascii=False)
+        print(f"📝 训练日志初始化: {training_log_path}")
     
     # Build model
     if rank == 0:
@@ -879,6 +1150,7 @@ def main():
         llm_path=args.llm_path,
         freeze_llm=True,  # Stage 2: Freeze LLM
         qformer_pretrained='blip2' if args.qformer_pretrained == 'blip2' else None,
+        qformer_version=args.qformer_version,
     )
     
     model = model.cuda()
@@ -926,6 +1198,7 @@ def main():
         gt_cache_path=args.gt_cache_train,
         image_processor=image_processor,
         tokenizer=tokenizer,
+        subset_scenes_file=args.subset_scenes,
     )
     
     # Check if val GT cache exists before creating val dataset
@@ -1046,6 +1319,47 @@ def main():
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         
+        # 【关键】用命令行参数的 LR 覆盖 checkpoint 中保存的 LR
+        # 原因：resume 时可能需要调整学习率（如从保守 LR 切换到更高 LR）
+        # optimizer.load_state_dict() 会恢复 checkpoint 的 LR，这里用 args 覆盖
+        lr_map = {
+            'qformer_backbone': args.lr_qformer_backbone,
+            'qformer_decoder': args.lr_qformer_decoder,
+            'qformer_projector': args.lr_qformer_projector,
+            'map_queries': args.lr_queries,
+            'cls_head': args.lr_cls_head,
+            'map_decoder': args.lr_decoder,
+            'scene_interaction': args.lr_scene_interaction,
+            'lora': args.lr_lora,
+        }
+        lr_changed = False
+        for group in optimizer.param_groups:
+            group_name = group.get('name', '')
+            if group_name in lr_map:
+                old_lr = group['lr']
+                new_lr = lr_map[group_name]
+                if abs(old_lr - new_lr) / max(old_lr, 1e-12) > 0.01:  # >1% 变化才算
+                    group['lr'] = new_lr
+                    group['initial_lr'] = new_lr  # scheduler 也需要这个
+                    if rank == 0:
+                        print(f"  📝 LR override: {group_name}: {old_lr:.1e} → {new_lr:.1e}")
+                    lr_changed = True
+                else:
+                    group['lr'] = new_lr
+                    group['initial_lr'] = new_lr
+        
+        if lr_changed:
+            # LR 发生变化时，重建 scheduler 以使用新的 base LR
+            # 保留 cosine decay 的进度（从当前 epoch 继续衰减）
+            steps_per_epoch = len(train_loader) // args.accumulation_steps
+            scheduler = get_lr_scheduler(optimizer, args, steps_per_epoch)
+            # 快进 scheduler 到当前步数
+            completed_steps = start_epoch * steps_per_epoch
+            for _ in range(completed_steps):
+                scheduler.step()
+            if rank == 0:
+                print(f"  📝 Scheduler rebuilt for new LRs, fast-forwarded {completed_steps} steps")
+        
         # Load EMA state if available
         if ema is not None and 'ema_state_dict' in checkpoint:
             ema.load_state_dict(checkpoint['ema_state_dict'])
@@ -1061,42 +1375,41 @@ def main():
         print("Starting Training...")
         print(f"  Gradient Accumulation: {args.accumulation_steps} steps")
         print(f"  EMA: {'Enabled' if ema else 'Disabled'}")
-        print(f"  Mixed Precision: {'FP16' if args.fp16 else 'FP32'}")
+        print(f"  Mixed Precision: {'BF16' if args.bf16 else 'FP16' if args.fp16 else 'FP32'}")
         print("="*70 + "\n")
     
     best_val_loss = float('inf')
     best_mAP = 0.0
+    training_log_path = os.path.join(args.output_dir, 'training_log.json')
     
     for epoch in range(start_epoch, args.epochs):
         if world_size > 1:
             train_sampler.set_epoch(epoch)
         
-        # Train
-        train_loss = train_one_epoch(
+        # Train（记录训练耗时）
+        import time as _time
+        t_train_start = _time.time()
+        train_log = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler,
-            epoch, args, rank, ema=ema
+            epoch, args, rank, local_rank=local_rank, ema=ema
         )
+        t_train_end = _time.time()
+        train_log["训练时长_分钟"] = round((t_train_end - t_train_start) / 60.0, 1)
         
         # Validate (skip if val_loader is None)
+        val_log = None
         if val_loader is not None and (epoch + 1) % args.eval_interval == 0:
-            # 【优化】前 3 个 epoch 跳过 mAP 计算（mAP 计算在大数据集上极慢，O(pred×GT)）
-            # 前期模型随机，mAP 无意义且计算量爆炸（~25000 pred × 5000 GT × 3 class × 3 thresh）
-            # 只在 epoch 4 之后才计算 mAP
-            should_compute_map = (epoch + 1) >= 4
-            if rank == 0 and not should_compute_map:
-                print(f"[INFO] Epoch {epoch+1}: Skipping mAP computation (too slow for early epochs). "
-                      f"Will start computing mAP from epoch 4.", flush=True)
-            val_result = validate(model, val_loader, epoch, args, rank, ema=ema, 
-                                  compute_map=should_compute_map)
+            # 每个 epoch 都计算 mAP，方便观察修复效果
+            should_compute_map = True
+            t_val_start = _time.time()
+            val_loss, val_metrics, val_log = validate(
+                model, val_loader, epoch, args, rank, ema=ema, 
+                compute_map=should_compute_map
+            )
+            t_val_end = _time.time()
+            val_log["验证时长_分钟"] = round((t_val_end - t_val_start) / 60.0, 1)
             
-            # Handle both old (float) and new (tuple) return format
-            if isinstance(val_result, tuple):
-                val_loss, val_metrics = val_result
-                current_mAP = val_metrics.get('mAP', 0.0)
-            else:
-                val_loss = val_result
-                val_metrics = {}
-                current_mAP = 0.0
+            current_mAP = val_metrics.get('mAP', 0.0)
             
             # Save best model (based on mAP if available, otherwise loss)
             if rank == 0:
@@ -1131,6 +1444,26 @@ def main():
                 optimizer, scheduler, epoch, args,
                 f'checkpoint_epoch_{epoch+1}.pth', ema=ema
             )
+        
+        # ===== 追加写入 training_log.json（仅 rank 0）=====
+        if rank == 0:
+            epoch_entry = {
+                "epoch": epoch + 1,
+                "训练": train_log,
+            }
+            if val_log is not None:
+                epoch_entry["验证"] = val_log
+            
+            # 读取已有日志，追加当前 epoch，重新写入
+            try:
+                with open(training_log_path, 'r', encoding='utf-8') as f:
+                    full_log = json.load(f)
+                full_log['epochs'].append(epoch_entry)
+                with open(training_log_path, 'w', encoding='utf-8') as f:
+                    json.dump(full_log, f, indent=2, ensure_ascii=False)
+                print(f"📝 Epoch {epoch+1} 日志已写入 {training_log_path}")
+            except Exception as e:
+                print(f"⚠️ 写入训练日志失败: {e}")
     
     # Save final model
     if rank == 0:
@@ -1149,6 +1482,7 @@ def main():
         print(f"  Best validation loss: {best_val_loss:.4f}")
         print(f"  Best mAP: {best_mAP*100:.2f}%")
         print(f"  Checkpoints saved to: {args.output_dir}")
+        print(f"  训练日志: {training_log_path}")
         print("="*70)
     
     # Cleanup

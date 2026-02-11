@@ -37,6 +37,7 @@ from typing import Dict, Optional, Tuple
 from transformers import AutoTokenizer
 
 from .qformer import QFormer, build_qformer
+from .qformer_v2 import QFormerV2, build_qformer_v2
 from .language_model.llava_map import LlavaMapDetectionModel
 from .map_decoder import MapDecoder
 from .map_config import MapDetectionConfig, DEFAULT_MAP_CONFIG
@@ -96,9 +97,13 @@ class LLaVAMapDetector(nn.Module):
         
         # 1. Q-Former for multi-view encoding
         print(f"\n{'='*60}")
-        print(f"Initializing Q-Former...")
+        qformer_ver = qformer_config.get('_version', 'v1')
+        print(f"Initializing Q-Former ({qformer_ver})...")
         print(f"{'='*60}")
-        self.qformer = build_qformer(qformer_config)
+        if qformer_ver == 'v2':
+            self.qformer = build_qformer_v2(qformer_config)
+        else:
+            self.qformer = build_qformer(qformer_config)
         # Move Q-Former to GPU
         # Note: Keep FP32 for numerical stability, will be cast to FP16 via autocast if needed
         self.qformer = self.qformer.cuda()
@@ -696,24 +701,34 @@ class LLaVAMapDetector(nn.Module):
                     gt_masks=gt_masks_list,
                 )
                 
-                # ========== 辅助损失：监督初始点和中间层（完整监督）==========
-                # 与 MapTR 一致：对每个中间层计算完整的 cls + pts + dir 损失
+                # ========== 辅助损失：监督中间层（P0修复版）==========
+                # 
+                # 【P0-2 修复】三处关键改动：
+                # 1. 跳过 layer 0（init_points）：现在用锚点+偏移，不需要直接监督
+                #    init_points 的监督信号会通过 refinement layers 间接传回
+                # 2. 降低辅助权重：0.5×6=3.0（旧）→ 0.2×5=1.0（新）
+                #    旧方案辅助损失占总损失 82%，主损失仅 18%
+                #    新方案辅助:主 = 1:1，梯度信号更平衡
+                # 3. 【P0-3 修复】pred_logits 使用 detach()
+                #    旧方案：分类头在 7 个损失项中都反向传播（1主+6辅），梯度被 7× 放大
+                #    新方案：辅助损失不传梯度到分类头，分类头只被主损失更新
+                #
                 if 'init_points' in decoder_output and 'intermediate_points' in decoder_output:
                     intermediate_points = decoder_output['intermediate_points']
                     
-                    # intermediate_points 包含: [init, layer1, layer2, layer3, layer4, layer5, layer6(=final)]
-                    # 我们监督除最终层外的所有中间层 (共 6 个)
-                    # 【修改】辅助损失权重：统一权重，避免梯度冲突导致训练不稳定
-                    # 递增权重 [0.1-0.6] 会导致浅层监督不足、深层过强，辅助损失爆炸（6.7倍主损失）
-                    # MapTR 3层用统一1.0，我们6层用统一0.5，总权重3.0倍（对齐MapTR）
-                    num_aux = len(intermediate_points) - 1  # 不包括最终层
-                    aux_weights = [0.5 for _ in range(num_aux)]  # [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                    # intermediate_points: [init, layer1, layer2, layer3, layer4, layer5, layer6(=final)]
+                    # intermediate_points[:-1] = [init, layer1, ..., layer5] (共 6 个)
+                    # 跳过 index 0 (init_points)，只监督 index 1-5
+                    num_aux = len(intermediate_points) - 1  # 6（不含最终层）
+                    aux_weight_per_layer = 0.2  # 5 层 × 0.2 = 总辅助权重 1.0
                     
                     aux_loss_total = 0.0
-                    for i, aux_pts in enumerate(intermediate_points[:-1]):
-                        # 计算完整的辅助损失（cls + pts + dir），与 MapTR 一致
+                    for i in range(1, num_aux):  # i = 1, 2, 3, 4, 5（跳过 i=0 即 init_points）
+                        aux_pts = intermediate_points[i]
+                        
+                        # 【P0-3 修复】pred_logits.detach() — 辅助损失不更新分类头
                         aux_loss_dict = self._compute_aux_full_loss(
-                            pred_logits=pred_logits_f32,  # 分类使用最终层的 logits
+                            pred_logits=pred_logits_f32.detach(),
                             pred_points=aux_pts.float(),
                             gt_labels_list=gt_labels_list,
                             gt_points_list=gt_points_list,
@@ -726,7 +741,7 @@ class LLaVAMapDetector(nn.Module):
                             self.criterion.weight_pts * aux_loss_dict['pts'] +
                             self.criterion.weight_dir * aux_loss_dict['dir']
                         )
-                        aux_loss_total = aux_loss_total + aux_weights[i] * aux_layer_loss
+                        aux_loss_total = aux_loss_total + aux_weight_per_layer * aux_layer_loss
                         
                         # 记录各项损失（用于监控）
                         loss_dict[f'loss_aux_{i}_cls'] = aux_loss_dict['cls'].detach()
@@ -805,7 +820,9 @@ class LLaVAMapDetector(nn.Module):
         if num_total_pos == 0:
             loss_pts = pred_points.sum() * 0.0
         else:
-            loss_pts = sum(all_pts_loss) / avg_factor
+            # 【修复】除以点数 P，与主损失 _points_loss 保持一致
+            num_points = pred_points.shape[2]  # P = 20
+            loss_pts = sum(all_pts_loss) / (avg_factor * num_points)
         
         # ========== 3. 方向损失 ==========
         all_dir_loss = []
@@ -855,8 +872,9 @@ class LLaVAMapDetector(nn.Module):
         if num_total_pos == 0:
             loss_dir = pred_points.sum() * 0.0
         else:
-            # 按实例数归一化（与 MapTR 一致）
-            loss_dir = sum(all_dir_loss) / avg_factor
+            # 【修复】除以边数 (P-1)，与主损失 _direction_loss 保持一致
+            num_edges = pred_points.shape[2] - 1  # P-1 = 19
+            loss_dir = sum(all_dir_loss) / (avg_factor * num_edges)
         
         return {
             'cls': loss_cls,
@@ -891,7 +909,8 @@ class LLaVAMapDetector(nn.Module):
         pred_points = output['pred_points']  # (B, 50, 20, 2)
         
         # Get scores and labels
-        pred_probs = torch.softmax(pred_logits, dim=-1)  # (B, 50, 3)
+        # 【修复】训练用 sigmoid focal loss，推理也要用 sigmoid 保持一致
+        pred_probs = pred_logits.sigmoid()  # (B, 50, 3)
         pred_scores, pred_labels = pred_probs.max(dim=-1)  # (B, 50)
         
         # Filter by threshold
@@ -913,6 +932,7 @@ def build_map_detector(
     llm_path: str = "lmsys/vicuna-7b-v1.5",
     freeze_llm: bool = True,
     qformer_pretrained: str = None,
+    qformer_version: str = 'v1',      # 'v1' = 原版, 'v2' = 三阶段双流
     use_lora: bool = True,            # 默认启用 LoRA 微调
     lora_r: int = 32,                  # 增加 rank 以提供足够学习能力
     lora_alpha: int = 64,              # 保持 alpha/r = 2
@@ -956,25 +976,48 @@ def build_map_detector(
     """
     # Default Q-Former config
     if qformer_config_path is None:
-        qformer_config = {
-            'img_backbone': 'resnet50',
-            'embed_dims': 256,
-            'num_queries': 768,
-            'num_decoder_layers': 6,
-            'llm_hidden_size': 4096,
-            # Enhanced 3D Position Encoding (ABC方案)
-            'depth_num': 32,        # 32个深度假设（更密集的深度采样）
-            'depth_start': 1.0,     # 最小深度 1米
-            'depth_max': 60.0,      # 最大深度 60米
-            'use_lid': True,        # 方案B: LID深度分布 (近密远疏)
-            # pc_range 格式：[x_min, y_min, z_min, x_max, y_max, z_max]
-            # 与 MapConfig 保持一致！MapTR 使用此范围
-            'pc_range': [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0],
-        }
+        if qformer_version == 'v1':
+            qformer_config = {
+                'img_backbone': 'resnet50',
+                'embed_dims': 256,
+                'num_queries': 768,
+                'num_decoder_layers': 6,
+                'llm_hidden_size': 4096,
+                # Enhanced 3D Position Encoding (ABC方案)
+                'depth_num': 32,
+                'depth_start': 1.0,
+                'depth_max': 60.0,
+                'use_lid': True,
+                'pc_range': [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0],
+            }
+        elif qformer_version == 'v2':
+            qformer_config = {
+                'img_backbone': 'resnet50',
+                'embed_dims': 256,
+                'num_output_tokens': 768,
+                'llm_hidden_size': 4096,
+                # 三阶段层数配置
+                'num_image_encoder_layers': 5,
+                'num_position_encoder_layers': 5,
+                'num_cross_attn_layers': 3,
+                'num_fusion_self_attn_layers': 3,
+                'num_compression_layers': 2,
+                # 3D Position Encoding
+                'depth_num': 32,
+                'depth_start': 1.0,
+                'depth_max': 60.0,
+                'use_lid': True,
+                'pc_range': [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0],
+            }
+        else:
+            raise ValueError(f"Unknown qformer_version: {qformer_version}. Use 'v1' or 'v2'.")
     else:
         import json
         with open(qformer_config_path, 'r') as f:
             qformer_config = json.load(f)
+    
+    # 记录 Q-Former 版本到 config，供 LLaVAMapDetector 使用
+    qformer_config['_version'] = qformer_version
     
     model = LLaVAMapDetector(
         qformer_config=qformer_config,
