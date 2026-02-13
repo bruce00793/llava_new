@@ -24,9 +24,18 @@ checkpoints/
 ckpts*/
 
 # ============================================
-# 数据集
+# 数据集（排除实际数据文件，但保留代码）
 # ============================================
 data/
+# 白名单：llava/data/ 下的代码文件需要保留
+!llava/data/
+!llava/data/__init__.py
+!llava/data/map_dataset.py
+!llava/data/map_gt/
+!llava/data/map_gt/__init__.py
+!llava/data/map_gt/nuscenes_map_api.py
+!llava/data/map_gt/geometry.py
+!llava/data/map_gt/cache.py
 
 # ============================================
 # 训练输出

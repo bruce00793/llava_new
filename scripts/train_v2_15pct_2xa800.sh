@@ -8,6 +8,10 @@ export CUDA_VISIBLE_DEVICES=0,1
 export OMP_NUM_THREADS=4
 export NCCL_P2P_DISABLE=0
 export NCCL_IB_DISABLE=0
+# ★ 增加 NCCL 超时时间（默认30分钟，改为2小时，避免保存 checkpoint 时超时）
+export NCCL_TIMEOUT=7200
+# ★ NCCL 调试（可选，遇到问题时开启）
+# export NCCL_DEBUG=INFO
 
 DATAROOT="/home/cly/auto/llava_test/LLaVA/data/nuscenes"
 VERSION="v1.0-trainval"
@@ -15,7 +19,16 @@ GT_CACHE="/home/cly/auto/llava_test/LLaVA/data/nuscenes/gt_cache"
 LLM_PATH="/home/cly/auto/llava_test/LLaVA/vicuna-7b-v1.5"
 SUBSET_FILE="./data/subset_15pct_scenes.txt"
 
-OUTPUT_DIR="./outputs/v2_15pct_2xa800_$(date +%Y%m%d_%H%M%S)"
+# ===== 恢复训练（从 checkpoint 继续）=====
+# 设置为 checkpoint 路径即可恢复，留空则从零开始
+RESUME_CKPT="./outputs/v2_15pct_2xa800_20260211_152449/checkpoint_epoch_14.pth"
+
+# ===== 输出目录（恢复时使用原目录，否则创建新目录）=====
+if [ -n "$RESUME_CKPT" ]; then
+    OUTPUT_DIR="$(dirname $RESUME_CKPT)"
+else
+    OUTPUT_DIR="./outputs/v2_15pct_2xa800_$(date +%Y%m%d_%H%M%S)"
+fi
 
 EPOCHS=24
 BATCH_SIZE=1
@@ -43,6 +56,7 @@ echo "Q-Former:       V2（三阶段双流 + 压缩瓶颈）"
 echo "GPU:            2× A800"
 echo "子集文件:       $SUBSET_FILE"
 echo "输出目录:       $OUTPUT_DIR"
+echo "恢复训练:       ${RESUME_CKPT:-无（从零开始）}"
 echo "Batch × Accum × GPU: $BATCH_SIZE × $ACCUMULATION_STEPS × $NUM_GPUS = 有效批量 $((BATCH_SIZE * ACCUMULATION_STEPS * NUM_GPUS))"
 echo "================================================================="
 
@@ -79,7 +93,8 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --output-dir "$OUTPUT_DIR" \
     --log-interval 10 \
     --save-interval 1 \
-    --eval-interval 2
+    --eval-interval 2 \
+    ${RESUME_CKPT:+--resume "$RESUME_CKPT"}
 
 echo "================================================================="
 echo "训练完成！Checkpoint 保存在: $OUTPUT_DIR"
